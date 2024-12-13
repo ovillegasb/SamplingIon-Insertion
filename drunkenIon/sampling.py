@@ -19,8 +19,48 @@ import os
 from concurrent.futures import ProcessPoolExecutor
 from scipy.spatial.transform import Rotation
 from ase import Atoms
+from pymatgen.core import Structure
+from tqdm import tqdm
+import spglib
+import warnings
+
+warnings.simplefilter("ignore", RuntimeWarning)
 
 angstroms_per_meter = 1e10
+
+
+def pymatgen2ase(struc):
+    atoms = Atoms(symbols=struc.atomic_numbers, cell=struc.lattice.matrix)
+    atoms.set_scaled_positions(struc.frac_coords)
+    return atoms
+
+
+def ase2pymatgen(struc):
+    lattice = struc.get_cell()
+    coordinates = struc.get_scaled_positions()
+    species = struc.get_chemical_symbols()
+    return Structure(lattice, species, coordinates)
+
+
+def symmetrize_structure(struct, initial_symprec=1e-3, final_symprec=1e-8):
+    ase_atoms = pymatgen2ase(struct)
+    # Convertir la estructura a un formato compatible con spglib
+    cell = (ase_atoms.get_cell(), ase_atoms.get_scaled_positions(), ase_atoms.get_atomic_numbers())
+
+    # Aplicar la simetría para simetrizar la estructura
+    symmetrized_cell = spglib.standardize_cell(cell, to_primitive=False, no_idealize=False, symprec=final_symprec)
+
+    spacegroup = spglib.get_spacegroup(symmetrized_cell, symprec=initial_symprec, symbol_type=0)
+    print("Spacegroup Symmetrized:", spacegroup)
+
+    refine_cell = spglib.refine_cell(symmetrized_cell, final_symprec)
+    spacegroup = spglib.get_spacegroup(refine_cell, symprec=initial_symprec, symbol_type=0)
+    print("Spacegroup refine:", spacegroup)
+
+    ase_atoms.set_cell(refine_cell[0])
+    ase_atoms.set_scaled_positions(refine_cell[1])
+
+    return ase2pymatgen(ase_atoms)
 
 
 def task_function():
@@ -346,6 +386,45 @@ def plot_clusters(ax, atoms, samples, centroids, cluster_labels, lattice, plane=
     ax.grid(False)
 
 
+def plot_clusters2(ax, atoms, samples, centroids, lattice, plane='xy'):
+    """Plot atoms and lattice like lines."""
+    planes = {'xy': (0, 1), 'xz': (0, 2), 'yz': (1, 2)}
+    if plane not in planes:
+        raise ValueError(f"Invalid plane '{plane}'. Choose from 'xy', 'xz', or 'yz'.")
+    indices = planes[plane]
+
+    origin = np.zeros(3)
+    # show_axis_3D(lattice)
+
+    # Define the start and end points for lattice vectors in the chosen plane
+    # v1, v2 = lattice[indices[0]], lattice[indices[1]
+    # v1, v2, v3 = lattice[:, indices[0]], lattice[:, indices[1]], [0, 0]
+    v1, v2, v3 = lattice
+    # vertices = [origin, v1, v1 + v2, v2, origin]
+    vertices = [origin, v1, v1 + v2, v2, origin, v1, v1 + v3, v3, v2 + v3, v2, origin]
+
+    # Plot the lattice by connecting vertices in the chosen plane
+    ax.plot([vertices[i][indices[0]] for i in range(len(vertices))],
+            [vertices[i][indices[1]] for i in range(len(vertices))], 'k-')
+
+    if plane == 'xy':
+        # BOX
+        # Atoms
+        ax.scatter(atoms[:, 0], atoms[:, 1], c="violet", s=200, edgecolor="k")
+        ax.scatter(centroids[:, 0], centroids[:, 1], c='red', s=200, alpha=0.75)
+    elif plane == 'xz':
+        ax.scatter(atoms[:, 0], atoms[:, 2], c="violet", s=100, edgecolor="k")
+        ax.scatter(centroids[:, 0], centroids[:, 2], c='red', s=200, alpha=0.75)
+    elif plane == 'yz':
+        ax.scatter(atoms[:, 1], atoms[:, 2], c="violet", s=100, edgecolor="k")
+        ax.scatter(centroids[:, 1], centroids[:, 2], c='red', s=200, alpha=0.75)
+
+    ax.set_xlabel(f'{plane[0]}-axis')
+    ax.set_ylabel(f'{plane[1]}-axis')
+    # ax.legend()
+    ax.grid(False)
+
+
 def plot_densities(ax, atoms, samples, lattice, plane='xy'):
     """Plot atoms and lattice like lines."""
 
@@ -438,6 +517,232 @@ def plot_box(ax, lattice):
         *(lattice[0] + lattice[1] + origin),
         *lattice[2], color='b', arrow_length_ratio=0.0
     )
+
+
+def compute_3d_density_histogram(positions, lattice_matrix, nx, ny, nz):
+    """
+    Calcula un histograma de densidad 3D en una celda unitaria.
+
+    Parámetros:
+    - positions: numpy array de forma (N, 3) con las posiciones de las partículas.
+    - lattice_matrix: numpy array de forma (3, 3) que define la celda unitaria.
+    - nx, ny, nz: número de divisiones en x, y y z respectivamente.
+
+    Retorna:
+    - hist: el histograma 3D con las densidades.
+    - edges: los bordes de los bins en cada dimensión.
+    """
+    
+    # Convertir posiciones a coordenadas dentro de la celda unitaria usando coordenadas fraccionales
+    fractional_positions = np.linalg.solve(lattice_matrix.T, positions.T).T % 1.0
+
+    # Crear el histograma de densidad 3D
+    hist, edges = np.histogramdd(
+        fractional_positions,
+        bins=(nx, ny, nz),
+        range=((0, 1), (0, 1), (0, 1))
+    )
+
+    return hist, edges
+
+
+def plot_density_3d(hist, edges, density_threshold=5):
+    """
+    Visualiza el histograma 3D de densidad, mostrando solo los puntos con densidad
+    superior a un umbral.
+
+    Parámetros:
+    - hist: el histograma 3D de densidad.
+    - edges: los bordes de los bins en cada dimensión.
+    - density_threshold: mínimo valor de densidad para visualizar un voxel.
+    """
+    # Obtenemos los centros de los bins en cada dimensión
+    x_centers = (edges[0][1:] + edges[0][:-1]) / 2
+    y_centers = (edges[1][1:] + edges[1][:-1]) / 2
+    z_centers = (edges[2][1:] + edges[2][:-1]) / 2
+
+    # Creamos una grilla de coordenadas 3D a partir de los centros de los bins
+    x, y, z = np.meshgrid(x_centers, y_centers, z_centers, indexing="ij")
+
+    # Filtramos las posiciones con densidad superior al umbral
+    mask = hist > density_threshold
+    x_points, y_points, z_points = x[mask], y[mask], z[mask]
+    densities = hist[mask]
+
+    # Graficamos los puntos con densidad mayor al umbral
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection="3d", proj_type='ortho')
+    # First remove fill
+    ax.xaxis.pane.fill = False
+    ax.yaxis.pane.fill = False
+    ax.zaxis.pane.fill = False
+
+    # Now set color to white (or whatever is "invisible")
+    ax.xaxis.pane.set_edgecolor('w')
+    ax.yaxis.pane.set_edgecolor('w')
+    ax.zaxis.pane.set_edgecolor('w')
+    img = ax.scatter(x_points, y_points, z_points, c=densities, cmap="viridis_r", marker="s", s=100)
+    plt.colorbar(img, ax=ax, label="Densidad")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    plt.show()
+
+
+def vector_pbc_general(r1, r2, lattice_matrix):
+    """
+    Calcula el vector de desplazamiento ajustado a través de condiciones periódicas generales.
+
+    Parámetros:
+    - r1: vector de posición inicial (en coordenadas cartesianas).
+    - r2: vector de posición final (en coordenadas cartesianas).
+    - lattice_matrix: matriz de la celda (3x3 numpy array).
+    
+    Retorna:
+    - Vector de desplazamiento ajustado en coordenadas cartesianas.
+    """
+    # Convertir las posiciones a coordenadas fraccionarias
+    lattice_inv = np.linalg.inv(lattice_matrix)
+    fractional_r1 = r1 @ lattice_inv
+    fractional_r2 = r2 @ lattice_inv
+    
+    # Calcula el vector de desplazamiento en coordenadas fraccionarias
+    fractional_displacement = fractional_r2 - fractional_r1
+    
+    # Aplica la convención de imagen mínima en coordenadas fraccionarias
+    fractional_displacement = fractional_displacement - np.round(fractional_displacement)
+    
+    # Convierte el desplazamiento ajustado de regreso a coordenadas cartesianas
+    cartesian_displacement = fractional_displacement @ lattice_matrix
+    return cartesian_displacement
+
+
+def periodic_distance2(r1, r2, lattice_matrix):
+    return np.linalg.norm(vector_pbc_general(r1, r2, lattice_matrix))
+
+
+def make_cluster_label(points, centroids, lattice_matrix):
+    """
+    Clasifica cada punto según el centroide más cercano en condiciones periódicas.
+    
+    Parámetros:
+    - points: array de puntos en coordenadas cartesianas, de tamaño (N, 3).
+    - centroids: array de posiciones de centroides en coordenadas cartesianas, de tamaño (M, 3).
+    - lattice_matrix: matriz de la celda (3x3 numpy array).
+    
+    Retorna:
+    - cluster_labels: lista con la etiqueta de cluster para cada punto (tamaño N).
+    """
+    cluster_labels = []
+    for point in points:
+        # Calcula la distancia a cada centroide bajo condiciones periódicas
+        distances = [periodic_distance2(point, centroid, lattice_matrix) for centroid in centroids]
+        
+        # Encuentra el índice del centroide más cercano
+        closest_centroid = np.argmin(distances)
+        cluster_labels.append(closest_centroid)
+    
+    return cluster_labels
+
+
+def periodic_distance(point, other_point, lattice_matrix):
+    """
+    Calcula la distancia mínima periódica entre dos puntos en un sistema periódico,
+    considerando la celda unitaria y sus imágenes.
+
+    Parámetros:
+    - point: numpy array (3,) con coordenadas cartesianas del primer punto.
+    - other_point: numpy array (3,) con coordenadas cartesianas del segundo punto.
+    - lattice_matrix: numpy array (3, 3) que define la celda unitaria.
+
+    Retorna:
+    - La distancia periódica mínima entre los dos puntos.
+    """
+    # Convertir el segundo punto a coordenadas fraccionales
+    frac_other = np.linalg.solve(lattice_matrix.T, other_point)
+
+    # Considerar desplazamientos de la celda en [-1, 0, 1] en coordenadas fraccionales
+    min_dist = np.inf
+    for dx in [-1, 0, 1]:
+        for dy in [-1, 0, 1]:
+            for dz in [-1, 0, 1]:
+                displacement = np.array([dx, dy, dz])
+                shifted_frac_other = frac_other + displacement
+                # Convertir a coordenadas cartesianas
+                shifted_cartesian_other = np.dot(shifted_frac_other, lattice_matrix)
+                dist = np.linalg.norm(shifted_cartesian_other - point)
+                min_dist = min(min_dist, dist)
+
+    return min_dist
+
+
+def find_top_n_dense_regions_with_min_distance(hist, edges, lattice_matrix, n, min_distance):
+    """
+    Encuentra los N índices más densos en el histograma 3D, manteniendo una distancia mínima periódica entre ellos.
+
+    Parámetros:
+    - hist: el histograma 3D con las densidades.
+    - edges: los bordes de los bins en cada dimensión.
+    - lattice_matrix: numpy array de forma (3, 3) que define la celda unitaria.
+    - n: número de regiones más densas a encontrar.
+    - min_distance: distancia mínima en Å entre las regiones densas.
+
+    Retorna:
+    - selected_indices: lista de los índices de los N voxeles más densos que cumplen con la distancia mínima.
+    - selected_cartesian_centers: lista de los centros de los N voxeles más densos en coordenadas cartesianas.
+    - selected_densities: lista de las densidades correspondientes a estos N índices.
+    """
+    # Aplanar el histograma y ordenar los índices por densidad
+    flat_hist = hist.ravel()
+    print(flat_hist, len(flat_hist))
+    sorted_indices_flat = np.argsort(flat_hist)[::-1]  # Índices en orden descendente de densidad
+    print(sorted_indices_flat, len(sorted_indices_flat))
+    
+    selected_indices = []
+    selected_cartesian_centers = []
+    selected_densities = []
+    
+    print("N porous to find:", n)
+    for idx_flat in sorted_indices_flat:
+        print("idx_flat", idx_flat)
+        if len(selected_indices) >= n:
+            break
+
+        # print(selected_cartesian_centers)
+        
+        # Convertir índice plano a 3D
+        idx_3d = np.unravel_index(idx_flat, hist.shape)
+        print("idx_3d", idx_3d)
+        
+        # Calcular el centro de este voxel en coordenadas fraccionales
+        frac_coords = [(edges[i][idx_3d[i]] + edges[i][idx_3d[i] + 1]) / 2 for i in range(3)]
+        print("frac_coords:", frac_coords)
+        # Convertir a coordenadas cartesianas
+        cartesian_coords = np.dot(frac_coords, lattice_matrix)
+        print("cartesian_coords:", cartesian_coords)
+        
+        # Comprobar la distancia mínima periódica respecto a los puntos seleccionados
+        too_close = False
+        for selected_point in selected_cartesian_centers:
+            dist = periodic_distance(cartesian_coords, selected_point, lattice_matrix)
+            print("Distance:", dist)
+            cart_coord_desp = vector_pbc_general(cartesian_coords, selected_point, lattice_matrix)
+            # print(cart_coord_desp)
+            # print(np.linalg.norm(cart_coord_desp))
+            dist = np.linalg.norm(cart_coord_desp)
+            if dist < min_distance:
+                too_close = True
+                break
+
+        # print("too close:", too_close)
+        # print("min_distance:", min_distance)
+        
+        if not too_close:
+            selected_indices.append(idx_3d)
+            selected_cartesian_centers.append(cartesian_coords)
+            selected_densities.append(hist[idx_3d])
+
+    return selected_indices, selected_cartesian_centers, selected_densities
 
 
 def apply_PBC_with_lattice(position, lattice_matrix):
@@ -536,11 +841,15 @@ def minimum_image_convention2(vec, lattice_matrix):
     return vec
 
 
-def V_electric_potential(r, r_center, lattice, min_dist=0.0, int_type=1):
+def V_electric_potential(r, r_center, lattice, min_dist=0.0, int_type=1, radius_ion=0.2):
     """Calculate the electric potential using a cutoff distance (unit Volt)."""
-    r_values = r - r_center
-    r_values = minimum_image_convention(r_values, lattice)
-    r_norm = np.linalg.norm(r_values)
+    # OLD
+    #r_values = r - r_center
+    #r_values = minimum_image_convention(r_values, lattice)
+    #r_norm = np.linalg.norm(r_values)
+    # NEW
+    r_norm = periodic_distance2(r, r_center, lattice)
+    r_norm -= radius_ion
 
     if r_norm > 2 * min_dist:
         # attraction
@@ -593,6 +902,7 @@ def monte_carlo_metropolis(n_steps, T, r_init, centers, step_size, lattice, min_
     # Inicialización
     r_current = r_init
     history = [r_current]
+    allhistory = [r_current]
     energies = []
     n_accept = 0
     current_cpu = task_function()
@@ -603,6 +913,7 @@ def monte_carlo_metropolis(n_steps, T, r_init, centers, step_size, lattice, min_
     # system.write("test.cif")
     ###NEW
 
+    pbar = tqdm(desc="MC sim", total=n_steps)
     while step < n_steps:
         # Generates a new position by disturbing the current one.
         r_new = r_current + np.random.uniform(-step_size, step_size, size=r_current.shape)
@@ -633,14 +944,28 @@ def monte_carlo_metropolis(n_steps, T, r_init, centers, step_size, lattice, min_
         if acceptance_probability(e*delta_V, T):
             r_current = r_new  # Acepta la nueva posición
             n_accept += 1
+            history.append(r_current)
 
         if not np.isinf(delta_V):
             energies.append(e*delta_V)
 
         # print(f"|{current_cpu}|", step, r_new, "|", f"{delta_V:.3e} volt", "|", f"{e*delta_V:.3e} eV")
 
-        history.append(r_current)
+        # # TODO Dynamic stepsize
+        # # Ejemplo de ajuste dinámico del tamaño del paso:
+        # if step % 100 == 0:  # Cada 100 pasos
+        #     acceptance_rate = n_accept / (step + 1)
+        #     if acceptance_rate < 0.3:
+        #         step_size *= 0.9  # Reduce el tamaño del paso si la tasa de aceptación es baja
+        #     elif acceptance_rate > 0.7:
+        #         step_size *= 1.1  # Aumenta el tamaño del paso si la tasa es alta
+
+        allhistory.append(r_current)
         step += 1
+        # print(step, end="\r")
+        pbar.update(1)
+
+    pbar.close()
 
     acceptance_rate = n_accept / n_steps
     print(f"|{current_cpu}| Acceptance rate: {acceptance_rate:.2f}")
@@ -648,7 +973,7 @@ def monte_carlo_metropolis(n_steps, T, r_init, centers, step_size, lattice, min_
     energies = np.array(energies)
     energies = np.where(np.isinf(energies), np.nan, energies)
 
-    return np.array(history), energies, acceptance_rate
+    return np.array(history), energies, acceptance_rate, np.array(allhistory)
 
 
 def apply_periodic_kmeans(positions, lattice_matrix, n_clusters, random_state=0):
@@ -687,7 +1012,7 @@ def apply_periodic_kmeans(positions, lattice_matrix, n_clusters, random_state=0)
 def periodic_silhouette_score(positions, lattice_matrix, n_clusters, random_state=0):
     # Extiende las posiciones periódicamente
     offsets = np.array([
-        [0, 0, 0],  # Celda original
+        [0, 0, 0],  # Original cell
         [1, 0, 0], [-1, 0, 0],
         [0, 1, 0], [0, -1, 0],
         [0, 0, 1], [0, 0, -1],
@@ -697,23 +1022,128 @@ def periodic_silhouette_score(positions, lattice_matrix, n_clusters, random_stat
         [1, 1, 1], [-1, -1, -1], [1, -1, 1], [-1, 1, -1]
     ])
 
+    # Expandimos las posiciones usando desplazamientos periódicos
     expanded_positions = []
     for offset in offsets:
         displacement = np.dot(offset, lattice_matrix)
         expanded_positions.append(positions + displacement)
     expanded_positions = np.vstack(expanded_positions)
 
-    # Ejecutamos KMeans sobre las posiciones expandidas
+    # fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+    # plot_lattice_and_atoms(axs[0], np.array([[0, 0, 0]]), expanded_positions, lattice_matrix, plane='xy')
+    # plot_lattice_and_atoms(axs[1], np.array([[0, 0, 0]]), expanded_positions, lattice_matrix, plane='xz')
+    # plot_lattice_and_atoms(axs[2], np.array([[0, 0, 0]]), expanded_positions, lattice_matrix, plane='yz')
+    # plt.tight_layout()
+    # plt.show()
+
+
+    ######
+    """
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection='3d', proj_type='ortho')
+    # First remove fill
+    ax.xaxis.pane.fill = False
+    ax.yaxis.pane.fill = False
+    ax.zaxis.pane.fill = False
+    # Now set color to white (or whatever is "invisible")
+    ax.xaxis.pane.set_edgecolor('w')
+    ax.yaxis.pane.set_edgecolor('w')
+    ax.zaxis.pane.set_edgecolor('w')
+    ax.scatter(
+        expanded_positions[:, 0],
+        expanded_positions[:, 1],
+        expanded_positions[:, 2],
+        c="blue", marker=".", alpha=0.4,
+    )
+    # Añadir etiquetas y leyenda
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.legend()
+    # Bonus: To get rid of the grid as well:
+    ax.grid(False)
+    plt.show()
+    """
+    ######
     kmeans = KMeans(n_clusters=n_clusters, random_state=random_state)
+
+    # Ejecutamos KMeans sobre las posiciones expandidas
     kmeans.fit(expanded_positions)
 
     # Calculamos el `silhouette_score` usando solo las posiciones originales
     original_labels = kmeans.labels_[:len(positions)]
+    centroids = kmeans.cluster_centers_
+    # print("")
+    # print(lattice_matrix)
+    inv_lattice_matrix = np.linalg.inv(lattice_matrix)
+    # print(inv_lattice_matrix)
+    # print(centroids)
+    # Convertir los centros de clústeres a coordenadas fraccionarias
+    # fractional_centroids = np.linalg.solve(lattice_matrix.T, centroids.T).T
+    # # print(fractional_centroids)
+    fractional_centroids = np.dot(inv_lattice_matrix, centroids.T).T
+    # print(fractional_centroids)
+    fractional_centroids = fractional_centroids % 1.0
+    # print(fractional_centroids)
+
+    # Ajustar a la celda unitaria aplicando el módulo 1 en las coordenadas fraccionarias
+    # fractional_centroids = fractional_centroids % 1.0
+    # Convertir de regreso a coordenadas cartesianas
+    # adjusted_centroids = fractional_centroids @ lattice_matrix
+    adjusted_centroids = np.dot(fractional_centroids, lattice_matrix)
+    # print(adjusted_centroids)
+
+    # Eliminar duplicados dentro de una tolerancia pequeña
+    unique_centroids = np.unique(np.round(adjusted_centroids, decimals=5), axis=0)
+    # print(unique_centroids)
+
+    # Seleccionamos las etiquetas de los clústeres para las posiciones originales
+    original_labels = kmeans.labels_[:len(positions)]
+
+    ######
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection='3d', proj_type='ortho')
+    # First remove fill
+    ax.xaxis.pane.fill = False
+    ax.yaxis.pane.fill = False
+    ax.zaxis.pane.fill = False
+    # Now set color to white (or whatever is "invisible")
+    ax.xaxis.pane.set_edgecolor('w')
+    ax.yaxis.pane.set_edgecolor('w')
+    ax.zaxis.pane.set_edgecolor('w')
+    # ax.scatter(
+    #     expanded_positions[:, 0],
+    #     expanded_positions[:, 1],
+    #     expanded_positions[:, 2],
+    #     c="blue", marker=".", alpha=0.4,
+    # )
+    ax.scatter(
+        positions[:, 0],
+        positions[:, 1],
+        positions[:, 2],
+        c="blue", marker=".", alpha=0.4,
+    )
+    ax.scatter(
+        unique_centroids[:, 0],
+        unique_centroids[:, 1],
+        unique_centroids[:, 2],
+        c="violet", s=200, marker=".", alpha=1.0,
+    )
+
+    plot_box(ax, lattice_matrix)
+    # Añadir etiquetas y leyenda
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    # Bonus: To get rid of the grid as well:
+    ax.grid(False)
+    plt.show()
+    ######
 
     # Calculamos el `silhouette_score` usando las posiciones originales
     score = silhouette_score(expanded_positions[:len(positions)], original_labels)
 
-    return score
+    return score, kmeans, unique_centroids, original_labels
 
 
 class DrunkenIon:
@@ -772,7 +1202,7 @@ class DrunkenIon:
             r_init = self.r_values[0]
             print("Initial particule position:", r_init)
             # Run Monte Carlo
-            trajectory, energies, acceptance_rate = monte_carlo_metropolis(
+            trajectory, energies, acceptance_rate, allhistory = monte_carlo_metropolis(
                 self.n_steps,
                 self.T,
                 r_init,
@@ -786,6 +1216,7 @@ class DrunkenIon:
             info_sim["traj"] = trajectory
             info_sim["ener"] = energies
             info_sim["acc_rate"] = acceptance_rate
+            info_sim["all"] = allhistory
         else:
             n_steps_by_cpu = int(self.n_steps / self.ncpus)
             args = []
@@ -824,6 +1255,39 @@ class DrunkenIon:
         print("done in %.3f s" % execution_time)
 
     def compute_Kmeans(self, k=4):
+        print("Using the better kmeans results, k:", k)
+        print(self.silhouette_scores)
+        # kmeans = self.silhouette_scores[k]
+        # Convertimos los centros de vuelta a la celda original
+        # print(kmeans.cluster_centers_)
+        # centers = kmeans.cluster_centers_ % lattice_matrix.diagonal()
+        centroids = self.silhouette_scores[k]["centroids"]
+        self.centroids = centroids
+        self.cluster_labels = self.silhouette_scores[k]["cluster_labels"]
+        points = self.info_sim["traj"]
+        # Aplicar el algoritmo k-means
+        #kmeans = KMeans(n_clusters=k)
+        #kmeans.fit(points)
+        # self.centroids, self.cluster_labels = apply_periodic_kmeans(points, self.lattice, k)
+        #self.centroids = kmeans.cluster_centers_
+        #self.cluster_labels = kmeans.labels_
+        # self.kmeans = kmeans
+        n_steps = self.n_steps
+        T = self.T
+        step_size = self.step_size
+        factor = self.factor
+
+        fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+        fig.suptitle(f"sim MC - nsteps: {n_steps} - T: {T} - step_size: {step_size:.2f} - factor: {factor:.2f}")
+        plot_clusters(axs[0], self.atoms_positions, points, self.centroids, self.cluster_labels, self.lattice, plane='xy')
+        plot_clusters(axs[1], self.atoms_positions, points, self.centroids, self.cluster_labels, self.lattice, plane='xz')
+        plot_clusters(axs[2], self.atoms_positions, points, self.centroids, self.cluster_labels, self.lattice, plane='yz')
+        plt.tight_layout()
+        plt.show()
+
+
+    def compute_Kmeans2(self, k=4):
+        print("Using the better kmeans results, k:", k)
         points = self.info_sim["traj"]
         # Aplicar el algoritmo k-means
         #kmeans = KMeans(n_clusters=k)
@@ -846,6 +1310,48 @@ class DrunkenIon:
         plt.show()
 
     def clusters_study(self, max_n_porous=8):
+        print("Searching number of probable porous...")
+        t_i = time.time()
+        points = self.info_sim["traj"]
+        silhouette_scores = {}
+        for k in range(2, max_n_porous+1):
+            print("Studying cluster number:", k, end=" - ")
+            silhouette_scores[k] = {}
+            t_i_c = time.time()
+            # kmeans = KMeans(n_clusters=k, random_state=0)
+            # _, labels = apply_periodic_kmeans(positions, lattice_matrix, n_clusters, random_state=0)
+            score, kmeans, centroids, cluster_labels = periodic_silhouette_score(points, self.lattice, k, random_state=0)
+            # labels = kmeans.fit_predict(data)
+            # score = silhouette_score(data, labels)
+            silhouette_scores[k]["score"] = score
+            silhouette_scores[k]["kmeans"] = kmeans
+            silhouette_scores[k]["centroids"] = centroids
+            silhouette_scores[k]["cluster_labels"] = cluster_labels
+            t_f_c = time.time()
+            execution_time_c = t_f_c - t_i_c
+            print("done %.3f" % execution_time_c)
+
+        max_score = 0
+        n_opt_k = 0
+
+        for k in silhouette_scores:
+            score = silhouette_scores[k]["score"]
+            if score > max_score:
+                max_score = score
+                n_opt_k = k
+
+        t_f = time.time()
+        execution_time = t_f - t_i
+        print("Number of cluster found: {} - score: {:.3f}".format(n_opt_k, max_score))
+        print("done in %.3f s" % execution_time)
+
+        self.n_opt_k = n_opt_k
+        self.silhouette_scores = silhouette_scores.copy()
+        self.compute_Kmeans(k=n_opt_k)
+
+
+
+    def clusters_study2(self, max_n_porous=8):
         print("Searching number of probable porous...")
         t_i = time.time()
         data = self.info_sim["traj"]
@@ -959,6 +1465,139 @@ class DrunkenIon:
         self.n_opt_k = n_opt_k
         self.compute_Kmeans(k=n_opt_k)
 
+    def find_centers(self, max_n_porous=8):
+        """Search for more probable centroids.."""
+        print("N centers to search:", max_n_porous)
+        points = self.info_sim["traj"]
+        lattice = self.lattice
+        binwidth = .5  # angstroms
+
+        # build 3D histogram
+        # nx, ny, nz = (5, 5, 5)
+        magnitudes = np.linalg.norm(lattice, axis=1)
+        nx, ny, nz = np.round(magnitudes / binwidth + 0.5).astype(np.int64)
+        hist, edges = compute_3d_density_histogram(
+            points,
+            lattice,
+            nx, ny, nz
+        )
+
+        plot_density_3d(hist, edges, density_threshold=5)
+
+        ######
+        fig = plt.figure(figsize=(10, 10))
+        ax = fig.add_subplot(111, projection='3d', proj_type='ortho')
+        # First remove fill
+        ax.xaxis.pane.fill = False
+        ax.yaxis.pane.fill = False
+        ax.zaxis.pane.fill = False
+
+        # Now set color to white (or whatever is "invisible")
+        ax.xaxis.pane.set_edgecolor('w')
+        ax.yaxis.pane.set_edgecolor('w')
+        ax.zaxis.pane.set_edgecolor('w')
+
+        ax.scatter(
+            points[:, 0],
+            points[:, 1],
+            points[:, 2],
+            c="blue", marker=".", alpha=0.4,
+        )
+
+        # Añadir etiquetas y leyenda
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        ax.legend()
+
+        # Bonus: To get rid of the grid as well:
+        ax.grid(False)
+        plt.show()
+        ######
+
+        n_steps = self.n_steps
+        T = self.T
+        step_size = self.step_size
+        factor = self.factor
+        
+        #print(hist)
+        #print(hist.shape)
+        #print(edges)
+        #print(len(edges))
+
+        # Encontrar el índice del voxel con la densidad más alta
+        max_density_idx = np.unravel_index(np.argmax(hist), hist.shape)
+        print(f"Índice del voxel más denso: {max_density_idx}")
+        print(f"Densidad máxima en el voxel: {hist[max_density_idx]}")
+
+        # Encontrar los N puntos más densos
+        # n = 5  # Número de regiones más densas a obtener
+        top_n_indices, top_n_cartesian_centers, top_n_densities = find_top_n_dense_regions_with_min_distance(
+            hist,
+            edges,
+            lattice,
+            max_n_porous,
+            min_distance=6.0
+        )
+
+        print("Índices de los voxeles más densos:", top_n_indices)
+        print("Centros en coordenadas cartesianas de las regiones más densas:", top_n_cartesian_centers)
+        print("Densidades de las regiones más densas:", top_n_densities)
+        centroids = np.array(top_n_cartesian_centers)
+        cluster_labels = make_cluster_label(points, centroids, lattice)
+
+        fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+        fig.suptitle(f"sim MC - nsteps: {n_steps} - T: {T} - step_size: {step_size:.2f} - factor: {factor:.2f}")
+        plot_clusters(axs[0], self.atoms_positions, points, np.array(top_n_cartesian_centers), cluster_labels, self.lattice, plane='xy')
+        plot_clusters(axs[1], self.atoms_positions, points, np.array(top_n_cartesian_centers), cluster_labels, self.lattice, plane='xz')
+        plot_clusters(axs[2], self.atoms_positions, points, np.array(top_n_cartesian_centers), cluster_labels, self.lattice, plane='yz')
+        plt.tight_layout()
+        plt.show()
+
+        exit()
+
+        v1, v2, v3 = lattice
+        fig = plt.figure(figsize=(8, 8))
+        ax = fig.add_subplot(111, projection='3d')
+
+        ax.xaxis.pane.fill = False
+        ax.yaxis.pane.fill = False
+        ax.zaxis.pane.fill = False
+
+        # Now set color to white (or whatever is "invisible")
+        ax.xaxis.pane.set_edgecolor('w')
+        ax.yaxis.pane.set_edgecolor('w')
+        ax.zaxis.pane.set_edgecolor('w')
+
+        plot_box(ax, lattice)
+        ax.scatter(
+            self.atoms_positions[:, 0],
+            self.atoms_positions[:, 1],
+            self.atoms_positions[:, 2],
+            c="violet",
+            s=500*np.array(self.min_dist),
+            edgecolor="k", alpha=0.8,
+            label="MOF skeleton"
+        )
+
+        ax.scatter(
+            centroids[:, 0],
+            centroids[:, 1],
+            centroids[:, 2],
+            c='red',
+            s=200,
+            alpha=1.
+        )
+
+        # Etiquetas y leyenda
+        ax.set_xlabel("X-axis")
+        ax.set_ylabel("Y-axis")
+        ax.set_zlabel("Z-axis")
+        ax.legend()
+        plt.show()
+        self.centroids = centroids
+        self.cluster_labels = cluster_labels
+
     def add_ions(self, ion, n_ions=None):
         # Buscando el punto mas probable
         # Número de clusters (grupos) que se espera encontrar
@@ -966,10 +1605,25 @@ class DrunkenIon:
 
         # Obtener los centroides (las coordenadas más probables en cada grupo)
         centroids = self.centroids
+        cluster_labels = self.cluster_labels
+
+        print("N porous to use:", len(centroids))
+
+        if n_ions != len(centroids):
+            print("Using a new cluster centers")
+            centroids = self.silhouette_scores[n_ions]["centroids"]
+
         if n_ions is not None:
             centroids = centroids[np.random.choice(len(centroids), n_ions, replace=False)]
 
-        print("N porous to use:", len(centroids))
+        points = self.info_sim["traj"]
+        #####fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+        #####fig.suptitle(f"sim MC - nsteps: {self.n_steps} - T: {self.T} - step_size: {self.step_size:.2f} - factor: {self.factor:.2f}")
+        #####plot_clusters(axs[0], self.atoms_positions, points, centroids, cluster_labels, self.lattice, plane='xy')
+        #####plot_clusters(axs[1], self.atoms_positions, points, centroids, cluster_labels, self.lattice, plane='xz')
+        #####plot_clusters(axs[2], self.atoms_positions, points, centroids, cluster_labels, self.lattice, plane='yz')
+        #####plt.tight_layout()
+        #####plt.show()
 
         #inertia = kmeans.inertia_
         #print(f"Inertia (Sum of squared distances to the centroids): {inertia}")
@@ -1017,7 +1671,9 @@ class DrunkenIon:
                     )
 
         print(struct)
-        struct.to(filename=f"{self.mof.name}_{ion.name}.cif"),
+        symm_struct = symmetrize_structure(struct)
+        struct.to(filename=f"{self.mof.name}_{ion.name}.cif")
+        symm_struct.to(filename=f"{self.mof.name}_{ion.name}_symm.cif"),
         print("Ion added")
 
     def save_state(self, file="sampling.pkl"):
@@ -1059,6 +1715,7 @@ class DrunkenIon:
             volumes.append(volume)
 
         print(f"Mean volume in porous :", np.mean(volumes))
+        print(f"Sum volume in porous :", np.sum(volumes))
 
     def show_plots_3D(self):
         """Show results in plots 3D."""
@@ -1321,12 +1978,13 @@ class DrunkenIon:
         T = self.T
         step_size = self.step_size
         traj = info_sim["traj"]
+        acc = info_sim["acc_rate"]
         factor = self.factor
 
         energies = info_sim["ener"]
         rmsd = calculate_rmsd(energies)
         fig, ax = plt.subplots(figsize=(6, 6))
-        ax.set_title(f"sim MC - nsteps: {n_steps} - T: {T} - step_size: {step_size:.2f} - factor: {factor:.2f}, RMSD: {rmsd:0.5e}")
+        ax.set_title(f"sim MC - nsteps: {n_steps} - T: {T} - step_size: {step_size:.2f} - factor: {factor:.2f}, RMSD: {rmsd:0.5e}, ACC: {acc:0.5f}")
         ax.plot(energies)
         ax.set_xlabel("accepted steps")
         ax.set_ylabel("diff energy (eV)")

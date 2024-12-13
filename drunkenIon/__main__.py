@@ -105,6 +105,13 @@ def options():
     )
 
     RunSampling.add_argument(
+        "--hist_study",
+        help="A hist 3D study is make.",
+        action="store_true",
+        default=False
+    )
+
+    RunSampling.add_argument(
         "-load",
         help="Load results from a file.",
         type=str,
@@ -190,6 +197,10 @@ def main():
 
     if not args["cluster_study"] and args["n_centers"] is not None:
         alignIon.compute_Kmeans(k=args["n_centers"])
+        alignIon.save_state()
+
+    if args["hist_study"]:
+        alignIon.find_centers(max_n_porous=args["n_porous"])
         alignIon.save_state()
 
     if args["show_plots"]:

@@ -26,11 +26,11 @@ class MOF:
         self.covalent_radii = [covalent_radii[site.specie.number] for site in struct]
         interaction_type = []
         for number in self.atomic_numbers:
-            if number in [8]:
+            if number in [-8]:
                 interaction_type.append(-1)
             else:
                 interaction_type.append(+1)
-        
+
         self.interaction_type = interaction_type
 
     def __str__(self):
